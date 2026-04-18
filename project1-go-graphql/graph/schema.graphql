@@ -1,0 +1,112 @@
+# GraphQL Schema — the contract between frontend and backend.
+# Every query/mutation/subscription here generates a Go method we must implement.
+
+# Scalar types beyond the built-ins. Time maps to time.Time in Go.
+scalar Time
+
+# ---------- Domain types ----------
+
+type User {
+  id: ID!
+  email: String!
+  name: String!
+  createdAt: Time!
+}
+
+# Enum keeps status values safe at the type-system level.
+# Clients cannot pass an arbitrary string; the GraphQL layer rejects unknown values.
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+type Project {
+  id: ID!
+  name: String!
+  description: String
+  owner: User!          # resolved lazily — see ProjectResolver.Owner in Go
+  tasks: [Task!]!       # same — loaded on demand, not eagerly joined in SQL
+  createdAt: Time!
+}
+
+type Task {
+  id: ID!
+  title: String!
+  description: String
+  status: TaskStatus!
+  project: Project!     # resolved lazily
+  assignee: User        # nullable — a task can be unassigned
+  createdAt: Time!
+  updatedAt: Time!
+}
+
+# Returned after login/signup. Frontend stores the token and sends it in the
+# Authorization header on subsequent requests.
+type AuthPayload {
+  token: String!
+  user: User!
+}
+
+# ---------- Inputs ----------
+# Input types are distinct from output types in GraphQL. You cannot reuse Task
+# as both — this separation is a deliberate schema-design discipline.
+
+input SignupInput {
+  email: String!
+  name: String!
+  password: String!
+}
+
+input LoginInput {
+  email: String!
+  password: String!
+}
+
+input CreateProjectInput {
+  name: String!
+  description: String
+}
+
+input CreateTaskInput {
+  projectId: ID!
+  title: String!
+  description: String
+  assigneeId: ID
+}
+
+input UpdateTaskInput {
+  id: ID!
+  title: String
+  description: String
+  status: TaskStatus
+  assigneeId: ID
+}
+
+# ---------- Root operations ----------
+
+type Query {
+  # `me` returns the currently authenticated user, or null if not logged in.
+  # The auth middleware populates context; the resolver reads from it.
+  me: User
+  projects: [Project!]!
+  project(id: ID!): Project
+  task(id: ID!): Task
+}
+
+type Mutation {
+  signup(input: SignupInput!): AuthPayload!
+  login(input: LoginInput!): AuthPayload!
+  createProject(input: CreateProjectInput!): Project!
+  createTask(input: CreateTaskInput!): Task!
+  updateTask(input: UpdateTaskInput!): Task!
+  deleteTask(id: ID!): Boolean!
+}
+
+type Subscription {
+  # Real-time updates to anyone watching a project. Implemented via
+  # an in-memory pub/sub — see resolvers/subscription.go.
+  # NOTE: this does not survive server restarts or scale horizontally; the
+  # README covers what you'd swap in (NATS/Redis) for production.
+  taskUpdated(projectId: ID!): Task!
+}

@@ -1,0 +1,313 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TaskFlow</title>
+<!--
+  Single-file HTML app. No build step, no framework.
+  Reasoning: the point of this project is the Go/GraphQL backend. Shipping
+  a React+Vite+TypeScript frontend would triple the setup time for reviewers
+  and hide the actual skill being demonstrated.
+  All UI state lives in plain JS closures; all server state lives in GraphQL.
+-->
+<style>
+  :root { --bg:#0b0d10; --panel:#151921; --text:#e6e9ee; --muted:#8a93a6;
+          --accent:#4f8cff; --danger:#e5484d; --ok:#4caf50; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;
+         background:var(--bg); color:var(--text); }
+  header { padding:12px 20px; background:var(--panel); display:flex;
+           justify-content:space-between; align-items:center;
+           border-bottom:1px solid #222; }
+  h1 { font-size:16px; margin:0; font-weight:600; }
+  main { max-width:900px; margin:24px auto; padding:0 20px; }
+  .card { background:var(--panel); padding:20px; border-radius:8px;
+          margin-bottom:16px; border:1px solid #222; }
+  input, textarea, select, button { font:inherit; padding:8px 10px;
+          background:#0f1218; color:var(--text); border:1px solid #2a2f3a;
+          border-radius:6px; }
+  input:focus, textarea:focus, select:focus { outline:none; border-color:var(--accent); }
+  button { cursor:pointer; background:var(--accent); color:white; border:none; }
+  button.secondary { background:transparent; border:1px solid #2a2f3a; }
+  button.danger { background:var(--danger); }
+  button:disabled { opacity:0.5; cursor:not-allowed; }
+  .row { display:flex; gap:8px; }
+  .row > * { flex:1; }
+  label { display:block; margin-bottom:4px; color:var(--muted); font-size:12px; }
+  .field { margin-bottom:12px; }
+  ul { list-style:none; padding:0; margin:0; }
+  li.task { display:flex; align-items:center; gap:10px; padding:10px;
+            border-bottom:1px solid #222; }
+  li.task:last-child { border:none; }
+  .status { font-size:11px; padding:2px 8px; border-radius:12px;
+            background:#1f2937; color:var(--muted); }
+  .status.TODO { background:#374151; color:#d1d5db; }
+  .status.IN_PROGRESS { background:#1e3a8a; color:#93c5fd; }
+  .status.DONE { background:#14532d; color:#86efac; }
+  .err { color:var(--danger); margin-top:8px; }
+  .muted { color:var(--muted); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>TaskFlow</h1>
+  <div id="who" class="muted"></div>
+</header>
+<main>
+  <!-- Auth card: shown when logged out -->
+  <div id="auth" class="card">
+    <h2 style="margin-top:0">Sign in</h2>
+    <div class="field"><label>Email</label>
+      <input id="email" type="email" autocomplete="email"></div>
+    <div class="field"><label>Password</label>
+      <input id="password" type="password" autocomplete="current-password"></div>
+    <div class="field hidden" id="nameField"><label>Name</label>
+      <input id="name"></div>
+    <div class="row">
+      <button id="btnLogin">Log in</button>
+      <button id="btnSignup" class="secondary">Create account</button>
+    </div>
+    <div id="authErr" class="err"></div>
+  </div>
+
+  <!-- App card: shown when logged in -->
+  <div id="app" class="hidden">
+    <div class="card">
+      <h2 style="margin-top:0">Your projects</h2>
+      <div class="row">
+        <input id="newProject" placeholder="New project name">
+        <button id="btnCreateProject">Create</button>
+      </div>
+      <ul id="projectList" style="margin-top:12px"></ul>
+    </div>
+
+    <div class="card hidden" id="projectDetail">
+      <h2 id="projectName" style="margin-top:0"></h2>
+      <div class="row">
+        <input id="newTask" placeholder="New task title">
+        <button id="btnCreateTask">Add task</button>
+      </div>
+      <ul id="taskList" style="margin-top:12px"></ul>
+      <div class="muted" style="margin-top:12px; font-size:12px">
+        Live updates via Server-Sent Events — change status and watch the list refresh without reload.
+      </div>
+    </div>
+  </div>
+</main>
+
+<script>
+/* ----------------------------------------------------------------------
+   Tiny GraphQL client.
+   We roll our own instead of pulling in Apollo or urql; it's ~20 lines
+   and makes it obvious exactly what the frontend sends to the server.
+---------------------------------------------------------------------- */
+const API = '/graphql';
+let token = localStorage.getItem('token') || '';
+let currentProjectId = null;
+let sse = null; // active EventSource
+
+async function gql(query, variables) {
+  const res = await fetch(API, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      // Authorization header is only added if we have a token.
+      // The server middleware treats missing-header as "not logged in".
+      ...(token ? { 'Authorization': 'Bearer ' + token } : {}),
+    },
+    body: JSON.stringify({ query, variables }),
+  });
+  const body = await res.json();
+  if (body.errors && body.errors.length) {
+    // GraphQL returns 200 even for operation-level errors — we re-throw
+    // so callers can use try/catch normally.
+    throw new Error(body.errors[0].message);
+  }
+  return body.data;
+}
+
+/* ---------- Auth ---------- */
+const $ = (id) => document.getElementById(id);
+
+$('btnSignup').onclick = async () => {
+  // Toggle the name field on first click; second click actually signs up.
+  if ($('nameField').classList.contains('hidden')) {
+    $('nameField').classList.remove('hidden');
+    $('btnSignup').textContent = 'Sign up';
+    return;
+  }
+  try {
+    const data = await gql(
+      `mutation($i: SignupInput!) {
+         signup(input: $i) { token user { id name email } }
+       }`,
+      { i: { email: $('email').value, name: $('name').value, password: $('password').value } }
+    );
+    setAuth(data.signup);
+  } catch (e) { $('authErr').textContent = e.message; }
+};
+
+$('btnLogin').onclick = async () => {
+  try {
+    const data = await gql(
+      `mutation($i: LoginInput!) {
+         login(input: $i) { token user { id name email } }
+       }`,
+      { i: { email: $('email').value, password: $('password').value } }
+    );
+    setAuth(data.login);
+  } catch (e) { $('authErr').textContent = e.message; }
+};
+
+function setAuth({ token: t, user }) {
+  token = t;
+  localStorage.setItem('token', t);
+  $('who').textContent = user.name + ' · log out';
+  $('who').style.cursor = 'pointer';
+  $('who').onclick = logout;
+  $('auth').classList.add('hidden');
+  $('app').classList.remove('hidden');
+  loadProjects();
+}
+function logout() {
+  token = '';
+  localStorage.removeItem('token');
+  location.reload();
+}
+
+/* ---------- Projects ---------- */
+async function loadProjects() {
+  const data = await gql(`{ projects { id name description } }`);
+  const ul = $('projectList');
+  ul.innerHTML = '';
+  data.projects.forEach(p => {
+    const li = document.createElement('li');
+    li.className = 'task';
+    li.innerHTML = `<span style="flex:1; cursor:pointer">${escapeHTML(p.name)}</span>`;
+    li.firstElementChild.onclick = () => openProject(p.id, p.name);
+    ul.appendChild(li);
+  });
+}
+
+$('btnCreateProject').onclick = async () => {
+  const name = $('newProject').value.trim();
+  if (!name) return;
+  await gql(
+    `mutation($i: CreateProjectInput!) { createProject(input: $i) { id } }`,
+    { i: { name } }
+  );
+  $('newProject').value = '';
+  loadProjects();
+};
+
+async function openProject(id, name) {
+  currentProjectId = id;
+  $('projectDetail').classList.remove('hidden');
+  $('projectName').textContent = name;
+  await refreshTasks();
+  connectSSE(id);
+}
+
+/* ---------- Tasks ---------- */
+async function refreshTasks() {
+  const data = await gql(
+    `query($id: ID!) {
+       project(id: $id) {
+         tasks { id title description status assignee { name } }
+       }
+     }`,
+    { id: currentProjectId }
+  );
+  renderTasks(data.project.tasks);
+}
+
+function renderTasks(tasks) {
+  const ul = $('taskList');
+  ul.innerHTML = '';
+  tasks.forEach(t => {
+    const li = document.createElement('li');
+    li.className = 'task';
+    li.dataset.id = t.id;
+    li.innerHTML = `
+      <span style="flex:1">${escapeHTML(t.title)}</span>
+      <select data-act="status">
+        <option ${t.status==='TODO'?'selected':''}>TODO</option>
+        <option ${t.status==='IN_PROGRESS'?'selected':''}>IN_PROGRESS</option>
+        <option ${t.status==='DONE'?'selected':''}>DONE</option>
+      </select>
+      <button class="danger" data-act="del">×</button>
+    `;
+    li.querySelector('[data-act=status]').onchange = e =>
+      updateTaskStatus(t.id, e.target.value);
+    li.querySelector('[data-act=del]').onclick = () => deleteTask(t.id);
+    ul.appendChild(li);
+  });
+}
+
+$('btnCreateTask').onclick = async () => {
+  const title = $('newTask').value.trim();
+  if (!title || !currentProjectId) return;
+  await gql(
+    `mutation($i: CreateTaskInput!) { createTask(input: $i) { id } }`,
+    { i: { projectId: currentProjectId, title } }
+  );
+  $('newTask').value = '';
+  // We rely on SSE to update the list, but also refresh in case SSE is
+  // momentarily disconnected. Cost: one extra query. Benefit: no stale UI.
+  refreshTasks();
+};
+
+async function updateTaskStatus(id, status) {
+  await gql(
+    `mutation($i: UpdateTaskInput!) { updateTask(input: $i) { id status } }`,
+    { i: { id, status } }
+  );
+}
+
+async function deleteTask(id) {
+  await gql(`mutation($id: ID!) { deleteTask(id: $id) }`, { id });
+  refreshTasks();
+}
+
+/* ---------- Live updates via SSE ---------- */
+function connectSSE(projectId) {
+  if (sse) sse.close();
+  // Token in query string because EventSource can't set headers.
+  // The server re-verifies this token just like it would a header token.
+  sse = new EventSource(`/api/events?projectId=${encodeURIComponent(projectId)}&token=${encodeURIComponent(token)}`);
+  sse.addEventListener('task', () => {
+    // When ANY task changes in this project, refetch the list. Simpler
+    // and more correct than applying partial updates client-side —
+    // avoids drift between server truth and UI state.
+    refreshTasks();
+  });
+  sse.onerror = () => {
+    // EventSource auto-reconnects; we just log. A production UI might
+    // show a "reconnecting..." badge.
+    console.warn('SSE disconnected, auto-reconnecting');
+  };
+}
+
+/* ---------- Utils ---------- */
+function escapeHTML(s) {
+  // Tiny XSS guard — the server is the source of truth for task titles,
+  // but defense in depth: never inject user strings as raw HTML.
+  return s.replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+/* ---------- Boot ---------- */
+(async function boot() {
+  if (!token) return; // stay on auth screen
+  try {
+    const data = await gql(`{ me { id name email } }`);
+    if (data.me) setAuth({ token, user: data.me });
+  } catch {
+    // Token is probably expired. Clear and show login.
+    logout();
+  }
+})();
+</script>
+</body>
+</html>

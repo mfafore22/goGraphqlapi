@@ -1,0 +1,6 @@
+/taskflow
+*.exe
+*.log
+.env
+.DS_Store
+/tmp/

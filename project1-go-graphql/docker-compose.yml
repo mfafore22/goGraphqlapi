@@ -1,0 +1,45 @@
+# docker-compose.yml
+# One-command local stack: Postgres + the Go app.
+#   docker compose up --build
+#
+# The app waits for Postgres to be healthy before starting, then runs the
+# migration on first boot. Data persists in the `pgdata` volume across restarts.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: taskflow
+      POSTGRES_PASSWORD: taskflow
+      POSTGRES_DB: taskflow
+    ports:
+      - "5432:5432"  # exposed so you can poke at it with psql from the host
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      # Mount the migration SQL into the image's init dir. Postgres runs
+      # any .sql file here once, the first time the data volume is empty.
+      - ./migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql:ro
+    healthcheck:
+      # pg_isready returns 0 when the server is accepting connections.
+      # Compose uses this to delay `app` until the DB is actually ready.
+      test: ["CMD-SHELL", "pg_isready -U taskflow -d taskflow"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  app:
+    build: .
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      # sslmode=disable is fine for localhost. In production you'd require
+      # SSL and use a managed cert, ideally via a connection-pool sidecar.
+      DATABASE_URL: postgres://taskflow:taskflow@db:5432/taskflow?sslmode=disable
+      JWT_SECRET: dev-only-change-me-in-prod
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
